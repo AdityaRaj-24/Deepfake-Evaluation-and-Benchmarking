@@ -1,0 +1,21 @@
+# Virtual environments
+venv/
+.venv311/
+.venv/
+env/
+ENV/
+
+#dataset
+dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Training outputs
+weights/
+results/
+
+# IDE
+.vscode/
+.idea/
