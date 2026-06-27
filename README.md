@@ -1,317 +1,122 @@
+
 # Benchmarking Deepfake Detection Methods
 
-As a course project under EE656, we present the implementation of the paper:
+<p align="center">
 
-**Towards Benchmarking and Evaluating Deepfake Detection**  
-Jingyi Deng et al., IEEE Transactions on Dependable and Secure Computing, 2024
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red)
+![License](https://img.shields.io/badge/License-MIT-green)
 
----
+</p>
+
+Implementation of the IEEE TDSC 2024 benchmark framework proposed in **"Towards Benchmarking and Evaluating Deepfake Detection"**.
 
 ## Overview
 
-Deepfake generation techniques have advanced rapidly in recent years, creating highly realistic synthetic media that poses significant challenges in misinformation detection, digital forensics, privacy protection, and cybersecurity.
+This repository benchmarks four representative deepfake detection architectures under a unified training and evaluation pipeline.
 
-This project presents a comparative benchmarking study of representative deepfake detection architectures inspired by the evaluation framework proposed in the paper.  
-
-Rather than reproducing the complete benchmark containing thirteen detection algorithms, this project implements and evaluates four representative detectors spanning multiple deepfake detection paradigms:
-
-* Meso4 — Lightweight CNN-based detector
-* Xception — Deep CNN baseline
-* Patch ResNet Layer1 — Patch-level artifact detector
-* M2TR — Multi-modal Transformer-based detector
-
-The goal is to compare their effectiveness, efficiency, robustness, and deployment practicality under a unified evaluation framework.
-
-## Project Objectives
-
-The project aims to:
-
-* Implement representative deepfake detection architectures.
-* Compare multiple detection philosophies under identical evaluation conditions.
-* Analyze performance beyond accuracy using practical deployment metrics.
-* Study the trade-off between computational cost and detection capability.
-* Investigate robustness under image perturbations and compression artifacts.
-
-## Detection Architectures
-
-### 1. Meso4
-
-Meso4 is a lightweight convolutional neural network designed specifically for deepfake detection.
-
-Characteristics:
-
-* Shallow architecture
-* Low parameter count
-* Fast inference
-* Suitable for resource-constrained environments
-
-Detection philosophy:
-
-```text
-Face Image
-     ↓
-Mesoscopic Feature Extraction
-     ↓
-Binary Classification
-```
-
----
-
-### 2. Xception
-
-Xception serves as one of the most widely adopted deepfake detection baselines.
-
-Characteristics:
-
-* Deep separable convolutions
-* Strong feature extraction capability
-* High benchmark popularity
-* Robust image-level classification
-
-Detection philosophy:
-
-```text
-Face Image
-     ↓
-XceptionNet
-     ↓
-Real / Fake
-```
-
----
-
-### 3. Patch ResNet Layer1
-
-Patch-based detection focuses on local manipulation artifacts instead of global image appearance.
-
-Characteristics:
-
-* Local artifact learning
-* Patch-level supervision
-* Better sensitivity to small forgery regions
-
-Detection philosophy:
-
-```text
-Image
-  ↓
-Patch Extraction
-  ↓
-Patch Classification
-  ↓
-Prediction Aggregation
-  ↓
-Final Decision
-```
-
----
-
-### 4. M2TR
-
-M2TR (Multi-modal Multi-scale Transformer) represents a modern state-of-the-art deepfake detector.
-
-Characteristics:
-
-* Transformer-based architecture
-* Spatial feature learning
-* Frequency-domain analysis
-* Multi-stream feature fusion
-
-Detection philosophy:
-
-```text
-Image
-   ├── Spatial Stream
-   ├── Frequency Stream
-   ↓
-Cross-Modal Fusion
-   ↓
-Transformer Classification
-```
-
----
-
-## Methodology
-
-### Data Preprocessing
-
-The preprocessing pipeline consists of:
-
-1. Video frame extraction
-2. Face detection
-3. Face alignment
-4. Face cropping
-5. Dataset generation
-
-Workflow:
-
-```text
-Input Video
-      ↓
-Frame Extraction
-      ↓
-Face Detection
-      ↓
-Face Alignment
-      ↓
-Face Cropping
-      ↓
-Training Dataset
-```
-
----
+| Model | Detection Paradigm |
+|:------|:-------------------|
+| Meso4 | Lightweight CNN |
+| Xception | Deep CNN |
+| Patch ResNet | Patch-based CNN |
+| Multiple Attention (M2TR-inspired) | Attention-based |
 
 ## Repository Structure
 
 ```text
 .
-├── classifiers.py
-├── pipeline.py
-├── train.ipynb
-├── benchmarking.ipynb
+├── Report
+├── Original Paper
+├── data/
+│   ├── dataset.py
 ├── models/
-│   ├── meso4/
-│   ├── xception/
-│   ├── patch_resnet/
-│   └── m2tr/
-│
-├── train_faces/
-├── test_faces/
+│   ├── meso4.py
+│   ├── xception.py
+│   ├── patch_resnet.py
+│   └── multiple_attention.py
+├── train.py
+├── benchmark.ipynb
+├── test.py
 ├── weights/
-└── README.md
+├── results/
+└── benchmark_output/
 ```
-
----
 
 ## Evaluation Metrics
 
-The benchmark evaluates models using multiple complementary metrics.
+- Accuracy
+- Balanced Accuracy
+- Precision / Recall / F1
+- MCC
+- ROC-AUC
+- PR-AUC
+- FLOPs
+- Parameters
+- FPS
+- Latency
 
-### Detection Performance
+# Benchmark Results
 
-* Accuracy
-* F1 Score
-* Confusion Matrix
-* ROC Curve
-* ROC-AUC
+## Detection Performance
 
-### Robustness Analysis
+| Model | Accuracy (%) | Balanced Acc. (%) | F1 (%) | ROC-AUC | PR-AUC | MCC |
+|:------|-------------:|------------------:|--------:|--------:|-------:|----:|
+| Meso4 | 75.00 | 50.00 | 85.71 | 0.5368 | 0.7881 | 0.0000 |
+| Xception | **82.67** | **73.56** | **88.82** | **0.8791** | **0.9531** | **0.5100** |
+| Patch ResNet | 76.33 | 69.33 | 84.08 | 0.7878 | 0.9119 | 0.3801 |
+| Multiple Attention | 82.00 | 72.89 | 88.36 | 0.8411 | 0.9361 | 0.4925 |
 
-* Contrast Adjustment
-* Saturation Adjustment
-* Gaussian Blur
-* JPEG Compression
-* Gaussian Noise
-  
+## Computational Efficiency
+
+| Model | Parameters (M) | GFLOPs | Model Size (MB) | FPS | Latency (ms/img) |
+|:------|---------------:|-------:|----------------:|----:|-----------------:|
+| Meso4 | 0.03 | 0.06 | 0.3 | **6551.6** | **0.15** |
+| Xception | 20.81 | 5.98 | 238.6 | 336.2 | 2.97 |
+| Patch ResNet | 11.18 | 2.38 | 128.0 | 1292.6 | 0.77 |
+| Multiple Attention | 12.92 | 2.48 | 148.0 | 1240.4 | 0.81 |
+
+## Benchmark Visualizations
+
+### Training Curves
+
+![Training Curves](benchmark_output/training_curves.png)
+
+### ROC Curves
+
+![ROC](benchmark_output/roc_curves.png)
+
+### Precision-Recall Curves
+
+![PR](benchmark_output/pr_curves.png)
+
+### Confusion Matrices
+
+![Confusion](benchmark_output/confusion_matrices.png)
+
+### Accuracy vs Speed
+
+![Speed](benchmark_output/accuracy_vs_fps.png)
+
 ### Model Complexity
-* FLOPs
-* Parameter Count
 
-### Efficiency
+![Parameters](benchmark_output/parameter_count.png)
 
-* Inference Time
-* Throughput
+## Key Findings
 
----
+- **Xception** achieved the best overall detection performance.
+- **Multiple Attention** offered competitive performance with substantially lower computational cost than Xception.
+- **Patch ResNet** provided a strong balance between efficiency and robustness.
+- **Meso4** remained extremely fast and lightweight but showed limited discriminative performance.
 
-## Experimental Workflow
+## Reference
 
-```text
-Dataset
-   ↓
-Preprocessing
-   ↓
+J. Deng et al., *Towards Benchmarking and Evaluating Deepfake Detection*, IEEE Transactions on Dependable and Secure Computing, 2024.
 
-Meso4
-Xception
-Patch ResNet
-M2TR
+## Team
 
-   ↓
-
-Prediction Generation
-   ↓
-
-Accuracy
-F1
-ROC-AUC
-Confusion Matrix
-FLOPs
-Parameters
-Inference Time
-Robustness Analysis
-```
-
----
-
-## Expected Comparative Analysis
-
-The benchmark is designed to answer the following questions:
-
-* How much performance is gained by moving from lightweight CNNs to deep CNNs?
-* Do patch-based methods improve local forgery detection?
-* Does frequency-domain information improve generalization?
-* Is the additional complexity of transformer-based detectors justified?
-* Which model offers the best balance between accuracy and efficiency?
-
----
-
-## Results
-
-### Detection Performance
-
-| Model        | Accuracy | F1 Score | AUC |
-| ------------ | -------- | -------- | --- |
-| Meso4        | TBD      | TBD      | TBD |
-| Xception     | TBD      | TBD      | TBD |
-| Patch ResNet | TBD      | TBD      | TBD |
-| M2TR         | TBD      | TBD      | TBD |
-
-### Efficiency Metrics
-
-| Model        | Parameters | FLOPs | Inference Time |
-| ------------ | ---------- | ----- | -------------- |
-| Meso4        | TBD        | TBD   | TBD            |
-| Xception     | TBD        | TBD   | TBD            |
-| Patch ResNet | TBD        | TBD   | TBD            |
-| M2TR         | TBD        | TBD   | TBD            |
-
----
-
-## Key Contributions
-
-* Implementation of four representative deepfake detection paradigms.
-* Unified benchmarking framework for fair comparison.
-* Robustness evaluation under realistic perturbations.
-* Computational efficiency analysis.
-* Practical comparison between CNN-based, patch-based, and transformer-based approaches.
-
----
-
-## Limitations
-
-This project does not attempt to reproduce the full benchmark proposed by Deng et al. (2024), which includes thirteen detection algorithms and a large-scale Imperceptible and Diverse (ID) Test Set.
-
-Instead, the focus is on a carefully selected subset of representative architectures that provide meaningful insight into modern deepfake detection strategies while remaining feasible within the scope of a course project.
-
----
-
-## References
-
-J. Deng, C. Lin, P. Hu, C. Shen, Q. Wang, Q. Li and Q. Li,
-
-"Towards Benchmarking and Evaluating Deepfake Detection,"
-
-IEEE Transactions on Dependable and Secure Computing, 2024.
-
----
-
-## Team Members:
-
-* Aditya Raj (240066)
-* Amrit Dwivedi (240111)
-* Keshav Agarwal (240537)
-* Kushagra Chandra (240585)
-* Mihir Tejaswi (240652)
-
----
+- Aditya Raj
+- Amrit Dwivedi
+- Keshav Agarwal
+- Kushagra Chandra
+- Mihir Tejaswi
