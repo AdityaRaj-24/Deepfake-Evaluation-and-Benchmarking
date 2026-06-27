@@ -9,18 +9,44 @@
 
 </p>
 
-Implementation of the IEEE TDSC 2024 benchmark framework proposed in **"Towards Benchmarking and Evaluating Deepfake Detection"**.
+### Overview
 
-## Overview
+This project presents a comparative benchmarking study of representative
+deepfake detection architectures inspired by the paper:
 
-This repository benchmarks four representative deepfake detection architectures under a unified training and evaluation pipeline.
+> **Towards Benchmarking and Evaluating Deepfake Detection**\
+> Jingyi Deng *et al.*, IEEE Transactions on Dependable and Secure
+> Computing, 2024.
+
+Rather than reproducing the original benchmark containing thirteen
+detectors, this project implements four representative architectures
+spanning different deepfake detection paradigms and evaluates them under
+a unified training and testing pipeline.
+
+The benchmark compares:
 
 | Model | Detection Paradigm |
 |:------|:-------------------|
 | Meso4 | Lightweight CNN |
-| Xception | Deep CNN |
+| Xception | Deep CNN baseline |
 | Patch ResNet | Patch-based CNN |
 | Multiple Attention (M2TR-inspired) | Attention-based |
+
+The project evaluates not only classification performance but also
+computational efficiency, enabling practical comparisons for real-world
+deployment.
+
+------------------------------------------------------------------------
+
+# Project Objectives
+
+-   Implement representative deepfake detection architectures.
+-   Train every model under a unified pipeline.
+-   Evaluate using identical preprocessing and test conditions.
+-   Compare detection performance and computational efficiency.
+-   Analyze trade-offs between accuracy and deployment cost.
+
+------------------------------------------------------------------------
 
 ## Repository Structure
 
@@ -29,7 +55,7 @@ This repository benchmarks four representative deepfake detection architectures 
 ├── Report
 ├── Original Paper
 ├── data/
-│   ├── dataset.py
+│   └── dataset.py
 ├── models/
 │   ├── meso4.py
 │   ├── xception.py
@@ -43,18 +69,91 @@ This repository benchmarks four representative deepfake detection architectures 
 └── benchmark_output/
 ```
 
-## Evaluation Metrics
+------------------------------------------------------------------------
 
-- Accuracy
-- Balanced Accuracy
-- Precision / Recall / F1
-- MCC
-- ROC-AUC
-- PR-AUC
-- FLOPs
-- Parameters
-- FPS
-- Latency
+# Models Evaluated
+
+## Meso4
+
+A lightweight CNN specifically designed for deepfake detection.
+
+**Characteristics**
+
+-   Extremely small model
+-   Very fast inference
+-   Suitable for embedded deployment
+
+------------------------------------------------------------------------
+
+## Xception
+
+A deep CNN using depthwise separable convolutions.
+
+**Characteristics**
+
+-   Strong feature extraction
+-   High detection accuracy
+-   Widely adopted benchmark model
+
+------------------------------------------------------------------------
+
+## Patch ResNet
+
+Processes local image patches independently before aggregating
+predictions.
+
+**Characteristics**
+
+-   Learns localized forgery artifacts
+-   Moderate computational cost
+-   Good balance between speed and accuracy
+
+------------------------------------------------------------------------
+
+## Multiple Attention
+
+A transformer-inspired architecture incorporating attention mechanisms.
+
+**Characteristics**
+
+-   Multi-scale feature aggregation
+-   Attention-based representation learning
+-   Competitive accuracy with moderate computational cost
+
+------------------------------------------------------------------------
+
+# Experimental Pipeline
+
+``` text
+Dataset
+    │
+    ▼
+Face Extraction
+    │
+    ▼
+Training
+    │
+    ▼
+Checkpoint Selection
+    │
+    ▼
+Test Evaluation
+    │
+    ├── Accuracy
+    ├── Balanced Accuracy
+    ├── F1 Score
+    ├── MCC
+    ├── ROC-AUC
+    ├── PR-AUC
+    ├── Confusion Matrix
+    ├── FLOPs
+    ├── Parameter Count
+    ├── Model Size
+    ├── FPS
+    └── Latency
+```
+
+------------------------------------------------------------------------
 
 # Benchmark Results
 
@@ -75,6 +174,8 @@ This repository benchmarks four representative deepfake detection architectures 
 | Xception | 20.81 | 5.98 | 238.6 | 336.2 | 2.97 |
 | Patch ResNet | 11.18 | 2.38 | 128.0 | 1292.6 | 0.77 |
 | Multiple Attention | 12.92 | 2.48 | 148.0 | 1240.4 | 0.81 |
+
+------------------------------------------------------------------------
 
 ## Benchmark Visualizations
 
@@ -102,21 +203,91 @@ This repository benchmarks four representative deepfake detection architectures 
 
 ![Parameters](benchmark_output/parameter_count.png)
 
-## Key Findings
+------------------------------------------------------------------------
 
-- **Xception** achieved the best overall detection performance.
-- **Multiple Attention** offered competitive performance with substantially lower computational cost than Xception.
-- **Patch ResNet** provided a strong balance between efficiency and robustness.
-- **Meso4** remained extremely fast and lightweight but showed limited discriminative performance.
+# Key Findings
+
+-   **Xception** achieved the highest overall detection performance,
+    obtaining the best ROC-AUC, PR-AUC, and MCC.
+-   **Multiple Attention** delivered performance close to Xception while
+    requiring significantly fewer computational resources.
+-   **Patch ResNet** provided a strong compromise between inference
+    speed and detection capability.
+-   **Meso4** was by far the fastest and smallest model but exhibited
+    substantially lower detection performance, illustrating the
+    trade-off between efficiency and robustness.
+
+------------------------------------------------------------------------
+
+# Evaluation Metrics
+
+Performance metrics:
+
+-   Accuracy
+-   Balanced Accuracy
+-   Precision
+-   Recall
+-   Specificity
+-   F1 Score
+-   ROC-AUC
+-   PR-AUC
+-   Matthews Correlation Coefficient (MCC)
+
+Efficiency metrics:
+
+-   Parameter Count
+-   FLOPs
+-   Model Size
+-   FPS
+-   Latency
+
+------------------------------------------------------------------------
+
+# Running the Project
+
+## Training
+
+``` bash
+python train.py --model xception
+```
+
+Available models:
+
+-   meso4
+-   xception
+-   patch_resnet
+-   multiple_attention
+
+## Benchmarking
+
+Open and execute:
+
+``` text
+benchmarking.ipynb
+```
+
+The notebook automatically:
+
+-   loads trained checkpoints,
+-   evaluates every model,
+-   generates ROC and PR curves,
+-   plots confusion matrices,
+-   measures inference speed,
+-   computes FLOPs and parameter counts,
+-   exports benchmark tables and figures.
+
+------------------------------------------------------------------------
 
 ## Reference
 
 J. Deng et al., *Towards Benchmarking and Evaluating Deepfake Detection*, IEEE Transactions on Dependable and Secure Computing, 2024.
 
-## Team
+------------------------------------------------------------------------
 
-- Aditya Raj
-- Amrit Dwivedi
-- Keshav Agarwal
-- Kushagra Chandra
-- Mihir Tejaswi
+# Team Members
+
+-   Aditya Raj (240066)
+-   Amrit Dwivedi (240111)
+-   Keshav Agarwal (240537)
+-   Kushagra Chandra (240585)
+-   Mihir Tejaswi (240652)
