@@ -67,11 +67,11 @@ def build_model(name: str) -> nn.Module:
     if name == "meso4":
         return Meso4()
     if name == "xception":
-        return XceptionDetector(pretrained=False)
+        return XceptionDetector(pretrained=True)
     if name == "patch_resnet":
-        return PatchResNet(pretrained=False)
+        return PatchResNet(pretrained=True)
     if name == "multiple_attention":
-        return MultipleAttentionDetector(pretrained=False)
+        return MultipleAttentionDetector(pretrained=True)
     raise ValueError(
         f"Unknown model: {name!r}. "
         "Choose from: meso4, xception, patch_resnet, multiple_attention"

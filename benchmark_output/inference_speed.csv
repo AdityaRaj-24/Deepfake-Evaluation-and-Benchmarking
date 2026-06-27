@@ -1,0 +1,5 @@
+Model,FPS,Latency (ms/img),Device
+Meso4,6143.0,0.16,cuda
+Xception,331.3,3.02,cuda
+Patch ResNet,1265.2,0.79,cuda
+Multiple Attention,1208.2,0.83,cuda

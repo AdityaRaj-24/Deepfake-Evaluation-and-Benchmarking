@@ -86,11 +86,11 @@ def build_model(name: str) -> nn.Module:
     if name == "meso4":
         return Meso4()
     if name == "xception":
-        return XceptionDetector(pretrained=False)
+        return XceptionDetector(pretrained=True)
     if name == "patch_resnet":
-        return PatchResNet(pretrained=False)
+        return PatchResNet(pretrained=True)
     if name == "multiple_attention":
-        return MultipleAttentionDetector(pretrained=False)
+        return MultipleAttentionDetector(pretrained=True)
     raise ValueError(
         f"Unknown model: {name!r}. "
         "Choose from: meso4, xception, patch_resnet, multiple_attention"
@@ -121,7 +121,7 @@ def get_args() -> argparse.Namespace:
         help="Detector architecture to train.",
     )
     p.add_argument("--epochs",      default=30,   type=int)
-    p.add_argument("--batch_size",  default=32,   type=int)
+    p.add_argument("--batch_size",  default=16,   type=int)
     p.add_argument("--lr",          default=1e-3, type=float)
     p.add_argument("--weight_decay",default=1e-4, type=float)
     p.add_argument("--image_size",  default=256,  type=int)
@@ -460,18 +460,22 @@ def run_epoch(
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(
-    path: str,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
-    scaler: torch.amp.GradScaler,
-    epoch: int,
-    best_val_loss: float,
-    best_val_accuracy: float,
-    args: argparse.Namespace,
-) -> None:
-    """Save a training checkpoint atomically (write to .tmp then rename)."""
-    tmp_path = path + ".tmp"
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch,
+    best_val_loss,
+    best_val_accuracy,
+    best_balanced_accuracy,
+    best_mcc,
+    args,
+):
+    """Save a training checkpoint."""
+
+    tmp_path = str(path) + ".tmp"
+
     torch.save(
         {
             "epoch": epoch,
@@ -479,45 +483,68 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
+
             "best_val_loss": best_val_loss,
             "best_val_accuracy": best_val_accuracy,
+            "best_balanced_accuracy": best_balanced_accuracy,
+            "best_mcc": best_mcc,
+
             "args": vars(args),
         },
         tmp_path,
     )
+
     os.replace(tmp_path, path)
 
 
 def load_checkpoint(
-    path: str,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
-    scaler: torch.amp.GradScaler,
-) -> tuple[int, float, float]:
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+):
     """
-    Load a checkpoint and restore model/optimizer/scheduler/scaler state.
+    Load a checkpoint and restore training state.
 
     Returns
     -------
-    start_epoch : int
-    best_val_loss : float
-    best_val_accuracy : float
+    start_epoch
+    best_val_loss
+    best_val_accuracy
+    best_balanced_accuracy
+    best_mcc
     """
+
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     scaler.load_state_dict(ckpt["scaler_state_dict"])
+
     start_epoch = ckpt["epoch"] + 1
+
     best_val_loss = ckpt.get("best_val_loss", float("inf"))
     best_val_accuracy = ckpt.get("best_val_accuracy", 0.0)
+    best_balanced_accuracy = ckpt.get("best_balanced_accuracy", 0.0)
+    best_mcc = ckpt.get("best_mcc", -1.0)
+
     print(
         f"Resumed from {path} "
-        f"(epoch {ckpt['epoch']}, val_loss={best_val_loss:.4f})"
+        f"(epoch {ckpt['epoch']}, "
+        f"val_loss={best_val_loss:.4f}, "
+        f"bal_acc={100*best_balanced_accuracy:.2f}%, "
+        f"MCC={best_mcc:.4f})"
     )
-    return start_epoch, best_val_loss, best_val_accuracy
 
+    return (
+        start_epoch,
+        best_val_loss,
+        best_val_accuracy,
+        best_balanced_accuracy,
+        best_mcc,
+    )
 
 # ---------------------------------------------------------------------------
 # Optimizer and scheduler
@@ -591,19 +618,39 @@ def main() -> None:
     os.makedirs("weights", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
-    weights_path = f"weights/{args.model}_best.pth"
+    weights_dir = Path("weights")
+
+    weights_loss_path = weights_dir / f"{args.model}_best.pth"
+    weights_bal_path = weights_dir / f"{args.model}_best_balacc.pth"
+    weights_mcc_path = weights_dir / f"{args.model}_best_mcc.pth"
+
     log_path = Path("results") / f"{args.model}_training_log.csv"
 
     # ------------------------------------------------------- optional resume
     start_epoch = 1
+
     best_loss = float("inf")
     best_acc = 0.0
+
+    best_bal_acc = 0.0
+    best_mcc = -1.0
+
     best_epoch = 0
     patience_counter = 0
 
     if args.resume is not None:
-        start_epoch, best_loss, best_acc = load_checkpoint(
-            args.resume, model, optimizer, scheduler, scaler
+        (
+            start_epoch,
+            best_loss,
+            best_acc,
+            best_bal_acc,
+            best_mcc,
+        ) = load_checkpoint(
+            args.resume,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
         )
 
     # -------------------------------------------------------- training loop
@@ -621,12 +668,20 @@ def main() -> None:
                 epoch, args.epochs,
             )
 
-            # Log LR *before* scheduler.step() — this is the LR used this epoch
+            # --- CLEAR CACHE AFTER TRAINING LOOP ---
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            # Log LR *before* scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
             scheduler.step()
 
             # Validate
             result = evaluate(model, val_loader, criterion, device)
+
+            # --- CLEAR CACHE AFTER VALIDATION METRICS ARE CALCULATED ---
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
             duration = time.perf_counter() - t0
 
@@ -651,26 +706,84 @@ def main() -> None:
                 patience_counter = 0
 
                 save_checkpoint(
-                    weights_path,
+                    weights_loss_path,
                     model, optimizer, scheduler, scaler,
-                    epoch, best_loss, best_acc, args,
+                    epoch, best_loss, best_acc,best_bal_acc,
+                    best_mcc, args,
                 )
                 print(
-                    f"  ✓ Saved {weights_path}  "
+                    f"  ✓ Saved {weights_loss_path}  "
                     f"(val_loss={best_loss:.4f}, val_acc={100 * best_acc:.2f}%)"
                 )
+
             else:
                 patience_counter += 1
                 print(f"  No improvement. Patience {patience_counter}/{args.patience}")
 
+            # ------------------------------------------
+            # Best Balanced Accuracy checkpoint
+            # ------------------------------------------
+
+            if result.balanced_accuracy > best_bal_acc:
+
+                best_bal_acc = result.balanced_accuracy
+
+                save_checkpoint(
+                    weights_bal_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    best_loss,
+                    best_acc,
+                    best_bal_acc,
+                    best_mcc,
+                    args,
+                )
+
+                print(
+                    f"  ✓ Saved {weights_bal_path.name} "
+                    f"(balanced_acc={100 * best_bal_acc:.2f}%)"
+                )     
+
+            # ------------------------------------------
+                # Best MCC checkpoint
+            # ------------------------------------------
+
+            if result.mcc > best_mcc:
+
+                best_mcc = result.mcc
+
+                save_checkpoint(
+                    weights_mcc_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    best_loss,
+                    best_acc,
+                    best_bal_acc,
+                    best_mcc,
+                    args,
+                )
+
+                print(
+                        f"  ✓ Saved {weights_mcc_path.name} "
+                        f"(MCC={best_mcc:.4f})"
+                    ) 
+
             if patience_counter >= args.patience:
                 print(f"\nEarly stopping triggered at epoch {epoch}.")
-                break
+                break       
 
     print(f"\n{'='*60}")
-    print(f"  Best val loss     : {best_loss:.4f}")
-    print(f"  Best val accuracy : {100 * best_acc:.2f}%")
-    print(f"  Best epoch        : {best_epoch}")
+    print(f"  Best val loss          : {best_loss:.4f}")
+    print(f"  Best val accuracy      : {100 * best_acc:.2f}%")
+    print(f"  Best balanced accuracy : {100 * best_bal_acc:.2f}%")
+    print(f"  Best MCC              : {best_mcc:.4f}")
+    print(f"  Best epoch            : {best_epoch}")
     print(f"  Log saved         : {log_path}")
     print(f"{'='*60}\n")
 

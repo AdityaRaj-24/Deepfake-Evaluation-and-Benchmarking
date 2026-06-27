@@ -1,0 +1,5 @@
+Model,Parameters (M),GFLOPs,Model Size (MB)
+Meso4,0.03,0.06,0.3
+Xception,20.81,5.98,238.6
+Patch ResNet,11.18,2.38,128.0
+Multiple Attention,12.92,2.48,148.0

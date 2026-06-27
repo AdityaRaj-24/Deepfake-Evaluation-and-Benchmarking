@@ -32,7 +32,7 @@ class PatchResNet(nn.Module):
     def __init__(
         self,
         patch_size=128,
-        pretrained=False,
+        pretrained=True,
         dropout=0.5,
     ):
         super().__init__()
@@ -190,7 +190,7 @@ if __name__ == "__main__":
 
     model = PatchResNet(
         patch_size=128,
-        pretrained=False,
+        pretrained=True,
     )
 
     x = torch.randn(
