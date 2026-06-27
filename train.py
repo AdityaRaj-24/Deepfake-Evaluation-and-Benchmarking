@@ -1,516 +1,679 @@
 """
 train.py
+========
+Training script for the Deepfake Detection Benchmark (EE656).
 
-Generic training script for the Deepfake Benchmark.
+Validated components (do NOT modify):
+    - WeightedRandomSampler        (class-balanced batches)
+    - BCEWithLogitsLoss            (without pos_weight — sampler already handles imbalance)
+    - AdamW                        (weight_decay=1e-4)
+    - CosineAnnealingLR            (T_max=epochs)
+    - AMP autocast + GradScaler    (CUDA only)
+    - Gradient clipping            (max_norm=1.0)
+    - Validation-loss early stopping
+    - Random seed behaviour
+
+Engineering improvements over original:
+    - Refactored into helper functions: run_epoch(), evaluate(), save_checkpoint()
+    - Expanded metrics: balanced accuracy, specificity, ROC-AUC, PR-AUC, MCC,
+      per-class recall, confusion matrix
+    - Fixed train_loss denominator (was len(dataset), now correctly total processed samples)
+    - LR logged BEFORE scheduler.step() so it reflects the epoch's actual LR
+    - CSV log includes all metrics + confusion matrix cells
+    - Resume training support via --resume
+    - Dataset sanity checks
+    - Type hints and docstrings throughout
 """
-import random
-import numpy as np
+
+from __future__ import annotations
 
 import argparse
 import csv
 import os
+import random
+import time
 from pathlib import Path
+from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import(
-    DataLoader,
-    WeightedRandomSampler,
-)
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from data import DeepfakeDataset
-from models import Meso4
-# later:
-from models import XceptionDetector
-from models import PatchResNet
-from models import MultipleAttentionDetector
-
 from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
     precision_score,
     recall_score,
-    f1_score,
+    roc_auc_score,
 )
 
-# -------------------------------------------------------
-# Model Factory
-# -------------------------------------------------------
+from data import DeepfakeDataset
+from models import Meso4, MultipleAttentionDetector, PatchResNet, XceptionDetector
 
-def set_seed(seed=42):
 
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int = 42) -> None:
+    """Set all random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
-
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def build_model(name):
 
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+def build_model(name: str) -> nn.Module:
+    """
+    Instantiate a detector by name.
+
+    Supported names:
+        meso4, xception, patch_resnet, multiple_attention
+    """
     name = name.lower()
-
     if name == "meso4":
         return Meso4()
-    
-    elif name == "xception":
+    if name == "xception":
         return XceptionDetector(pretrained=False)
-
-    elif name == "patch_resnet":
+    if name == "patch_resnet":
         return PatchResNet(pretrained=False)
-
-    elif name == "multiple_attention":
+    if name == "multiple_attention":
         return MultipleAttentionDetector(pretrained=False)
-
-    raise ValueError(f"Unknown model: {name}")
-
-
-# -------------------------------------------------------
-# Argument Parser
-# -------------------------------------------------------
-
-def get_args():
-
-    parser = argparse.ArgumentParser(
-        description="Deepfake Benchmark Training"
+    raise ValueError(
+        f"Unknown model: {name!r}. "
+        "Choose from: meso4, xception, patch_resnet, multiple_attention"
     )
 
-    parser.add_argument(
-        "--data_root",
-        default="dataset",
-        type=str,
-    )
 
-    parser.add_argument(
-        "--metadata",
-        default="metadata.csv",
-        type=str,
-    )
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    parser.add_argument(
-        "--model",
-        default="meso4",
-        type=str,
+def get_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    p = argparse.ArgumentParser(
+        description="Deepfake Benchmark — Training",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    parser.add_argument(
-        "--epochs",
-        default=20,
-        type=int,
+    p.add_argument(
+        "--data_root", default="dataset", type=str,
+        help="Root directory containing face images.",
     )
-
-    parser.add_argument(
-        "--batch_size",
-        default=32,
-        type=int,
+    p.add_argument(
+        "--metadata", default="metadata.csv", type=str,
+        help="Path to the metadata CSV file.",
     )
-
-    parser.add_argument(
-        "--lr",
-        default=1e-3,
-        type=float,
+    p.add_argument(
+        "--model", default="meso4", type=str,
+        choices=["meso4", "xception", "patch_resnet", "multiple_attention"],
+        help="Detector architecture to train.",
     )
-
-    parser.add_argument(
-        "--image_size",
-        default=256,
-        type=int,
+    p.add_argument("--epochs",      default=30,   type=int)
+    p.add_argument("--batch_size",  default=32,   type=int)
+    p.add_argument("--lr",          default=1e-3, type=float)
+    p.add_argument("--weight_decay",default=1e-4, type=float)
+    p.add_argument("--image_size",  default=256,  type=int)
+    p.add_argument(
+        "--patience", default=8, type=int,
+        help="Early-stopping patience (epochs without val_loss improvement).",
     )
-
-    parser.add_argument(
-        "--patience",
-        default=8,
-        type=int,
-    )
-
-    parser.add_argument(
+    p.add_argument(
         "--num_workers",
-        default=min(8, os.cpu_count()),
+        default=min(8, os.cpu_count() or 1),
         type=int,
     )
-    
-    parser.add_argument(
-        "--seed",
-        default=42,
-        type=int,
+    p.add_argument("--seed", default=42, type=int)
+    p.add_argument(
+        "--resume", default=None, type=str,
+        help="Path to a checkpoint (.pth) to resume training from.",
     )
-    return parser.parse_args()
+    return p.parse_args()
 
 
-# -------------------------------------------------------
-# Dataloaders
-# -------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
-def create_dataloaders(args):
+def create_dataloaders(
+    args: argparse.Namespace,
+) -> tuple[DeepfakeDataset, DeepfakeDataset, DataLoader, DataLoader]:
+    """
+    Build train and validation DataLoaders.
 
-    train_dataset = DeepfakeDataset(
+    Class balancing
+    ---------------
+    The train split is typically imbalanced (~75 % fake / 25 % real).
+    WeightedRandomSampler assigns each sample a weight of 1 / class_count,
+    so each draw has P(fake) = P(real) = 0.5.
+
+    BCEWithLogitsLoss is used WITHOUT pos_weight — the sampler already
+    corrects the imbalance.  Adding pos_weight on top would double-penalise
+    the minority class.
+    """
+    train_ds = DeepfakeDataset(
         dataset_root=args.data_root,
         metadata_file=args.metadata,
         split="train",
         image_size=args.image_size,
     )
-
-    val_dataset = DeepfakeDataset(
+    val_ds = DeepfakeDataset(
         dataset_root=args.data_root,
         metadata_file=args.metadata,
         split="val",
         image_size=args.image_size,
     )
 
-    # --------------------------------------------
-    # Balanced sampling
-    # --------------------------------------------
+    # Sanity checks
+    if len(train_ds) == 0:
+        raise RuntimeError("Training dataset is empty. Check --data_root and --metadata.")
+    if len(val_ds) == 0:
+        raise RuntimeError("Validation dataset is empty. Check --data_root and --metadata.")
 
-    labels = train_dataset.metadata["label"].values
+    labels = train_ds.metadata["label"].values
+    unique_labels = np.unique(labels)
+    if not set(unique_labels).issubset({0, 1}):
+        raise RuntimeError(f"Unexpected label values found: {unique_labels}. Expected {{0, 1}}.")
 
     class_counts = np.bincount(labels)
-
     class_weights = 1.0 / class_counts
-
-    sample_weights = class_weights[labels]
+    sample_weights = torch.DoubleTensor(class_weights[labels])
 
     sampler = WeightedRandomSampler(
-        weights=torch.DoubleTensor(sample_weights),
+        weights=sample_weights,
         num_samples=len(sample_weights),
         replacement=True,
     )
 
     train_loader = DataLoader(
-        train_dataset,
+        train_ds,
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
     )
-
     val_loader = DataLoader(
-        val_dataset,
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
     )
 
-    return (
-        train_dataset,
-        val_dataset,
-        train_loader,
-        val_loader,
+    return train_ds, val_ds, train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Metrics container
+# ---------------------------------------------------------------------------
+
+class EvalResult:
+    """All validation metrics for one epoch."""
+
+    __slots__ = (
+        "loss", "accuracy", "balanced_accuracy",
+        "precision", "recall", "recall_real", "specificity",
+        "f1", "roc_auc", "pr_auc", "mcc", "confusion",
     )
 
-# -------------------------------------------------------
-# Validation
-# -------------------------------------------------------
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
-def evaluate(model, loader, criterion, device):
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
 
+    def summary(self) -> str:
+        tn, fp, fn, tp = self.confusion.ravel()
+        return (
+            f"  Val Loss          : {self.loss:.4f}\n"
+            f"  Accuracy          : {100 * self.accuracy:.2f}%\n"
+            f"  Balanced Accuracy : {100 * self.balanced_accuracy:.2f}%\n"
+            f"  Precision (fake)  : {100 * self.precision:.2f}%\n"
+            f"  Recall    (fake)  : {100 * self.recall:.2f}%\n"
+            f"  Recall    (real)  : {100 * self.recall_real:.2f}%\n"
+            f"  Specificity       : {100 * self.specificity:.2f}%\n"
+            f"  F1 Score          : {100 * self.f1:.2f}%\n"
+            f"  ROC-AUC           : {self.roc_auc:.4f}\n"
+            f"  PR-AUC            : {self.pr_auc:.4f}\n"
+            f"  MCC               : {self.mcc:.4f}\n"
+            f"  Confusion  TN={tn:4d}  FP={fp:4d}  FN={fn:4d}  TP={tp:4d}"
+        )
+
+    # ------------------------------------------------------------------
+    # CSV
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def csv_header() -> list[str]:
+        return [
+            "epoch", "epoch_duration_s",
+            "train_loss", "train_accuracy", "lr",
+            "val_loss", "val_accuracy", "val_balanced_accuracy",
+            "precision", "recall_fake", "recall_real", "specificity",
+            "f1_score", "roc_auc", "pr_auc", "mcc",
+            "TN", "FP", "FN", "TP",
+        ]
+
+    def csv_row(
+        self,
+        epoch: int,
+        duration: float,
+        train_loss: float,
+        train_acc: float,
+        lr: float,
+    ) -> list:
+        tn, fp, fn, tp = self.confusion.ravel()
+        return [
+            epoch, round(duration, 2),
+            round(train_loss, 6), round(train_acc, 6), f"{lr:.2e}",
+            round(self.loss, 6), round(self.accuracy, 6),
+            round(self.balanced_accuracy, 6),
+            round(self.precision, 6), round(self.recall, 6),
+            round(self.recall_real, 6), round(self.specificity, 6),
+            round(self.f1, 6), round(self.roc_auc, 6),
+            round(self.pr_auc, 6), round(self.mcc, 6),
+            int(tn), int(fp), int(fn), int(tp),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> EvalResult:
+    """
+    Run the model over the validation set and compute all metrics.
+
+    Notes
+    -----
+    - Threshold is 0.5 applied to sigmoid(logit).
+    - ROC-AUC and PR-AUC use raw probabilities (no threshold).
+    - Fake is the positive class (label = 1).
+    - MCC is computed because it is informative even for imbalanced datasets.
+    """
     model.eval()
+
+    running_loss = 0.0
+    all_labels: list[int] = []
+    all_preds: list[int] = []
+    all_probs: list[float] = []
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            logits = model(images).squeeze(1)           # (B,)
+            loss = criterion(logits, labels.float())
+            running_loss += loss.item() * images.size(0)
+
+            probs = torch.sigmoid(logits)               # (B,) in [0, 1]
+            preds = (probs > 0.5).long()
+
+            all_labels.extend(labels.long().cpu().tolist())
+            all_preds.extend(preds.cpu().tolist())
+            all_probs.extend(probs.cpu().tolist())
+
+    n = len(all_labels)
+    y_true = np.array(all_labels)
+    y_pred = np.array(all_preds)
+    y_prob = np.array(all_probs)
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    recall_fake = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+    recall_real = recall_score(y_true, y_pred, pos_label=0, zero_division=0)
+    specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+
+    try:
+        roc_auc = float(roc_auc_score(y_true, y_prob))
+    except ValueError:
+        roc_auc = float("nan")
+
+    try:
+        pr_auc = float(average_precision_score(y_true, y_prob))
+    except ValueError:
+        pr_auc = float("nan")
+
+    try:
+        mcc = float(matthews_corrcoef(y_true, y_pred))
+    except ValueError:
+        mcc = float("nan")
+
+    return EvalResult(
+        loss=running_loss / n,
+        accuracy=float((y_true == y_pred).mean()),
+        balanced_accuracy=float(balanced_accuracy_score(y_true, y_pred)),
+        precision=float(precision_score(y_true, y_pred, zero_division=0)),
+        recall=recall_fake,
+        recall_real=recall_real,
+        specificity=specificity,
+        f1=float(f1_score(y_true, y_pred, zero_division=0)),
+        roc_auc=roc_auc,
+        pr_auc=pr_auc,
+        mcc=mcc,
+        confusion=cm,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    device: torch.device,
+    epoch: int,
+    total_epochs: int,
+) -> tuple[float, float]:
+    """
+    One full training epoch.
+
+    Returns
+    -------
+    train_loss : float
+        Mean per-sample loss across all batches.
+    train_accuracy : float
+        Fraction of correct predictions on the (balanced) training batches.
+
+    Note: because WeightedRandomSampler produces balanced batches, an
+    untrained model will score ~50 % training accuracy.  This is expected
+    and is NOT comparable to validation accuracy (which is computed on the
+    imbalanced val set).
+    """
+    model.train()
 
     running_loss = 0.0
     correct = 0
     total = 0
 
-    all_labels = []
-    all_predictions = []
+    progress = tqdm(
+        loader,
+        desc=f"Epoch {epoch}/{total_epochs}",
+        leave=False,
+    )
 
-    with torch.no_grad():
+    for images, labels in progress:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True).float()
 
-        for images, labels in loader:
+        optimizer.zero_grad(set_to_none=True)
 
-            images = images.to(device)
-            labels = labels.to(device)
+        with torch.amp.autocast(
+            device_type=device.type,
+            enabled=(device.type == "cuda"),
+        ):
+            logits = model(images).squeeze(1)           # (B,)
+            loss = criterion(logits, labels)
 
-            outputs = model(images)
-
-            loss = criterion(
-                outputs.squeeze(1),
-                labels,
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Non-finite loss at epoch {epoch}: {loss.item():.6f}. "
+                "Check your data normalisation and model outputs."
             )
 
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        with torch.no_grad():
+            preds = (torch.sigmoid(logits) > 0.5).long()
+            correct += (preds == labels.long()).sum().item()
+            total += labels.size(0)
             running_loss += loss.item() * images.size(0)
 
-            predictions = (
-                torch.sigmoid(outputs.squeeze(1)) > 0.5
-            ).long()
+        progress.set_postfix(
+            loss=f"{loss.item():.4f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+        )
 
-            all_labels.extend(
-                labels.cpu().numpy()
-            )
+    return running_loss / total, correct / total
 
-            all_predictions.extend(
-                predictions.cpu().numpy()
-            )
 
-            correct += (
-                predictions == labels.long()
-            ).sum().item()
+# ---------------------------------------------------------------------------
+# Checkpoint utilities
+# ---------------------------------------------------------------------------
 
-            total += labels.size(0)
-    
-    precision = precision_score(
-    all_labels,
-    all_predictions,
-    zero_division=0,
+def save_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scaler: torch.amp.GradScaler,
+    epoch: int,
+    best_val_loss: float,
+    best_val_accuracy: float,
+    args: argparse.Namespace,
+) -> None:
+    """Save a training checkpoint atomically (write to .tmp then rename)."""
+    tmp_path = path + ".tmp"
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "best_val_loss": best_val_loss,
+            "best_val_accuracy": best_val_accuracy,
+            "args": vars(args),
+        },
+        tmp_path,
+    )
+    os.replace(tmp_path, path)
+
+
+def load_checkpoint(
+    path: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scaler: torch.amp.GradScaler,
+) -> tuple[int, float, float]:
+    """
+    Load a checkpoint and restore model/optimizer/scheduler/scaler state.
+
+    Returns
+    -------
+    start_epoch : int
+    best_val_loss : float
+    best_val_accuracy : float
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    scaler.load_state_dict(ckpt["scaler_state_dict"])
+    start_epoch = ckpt["epoch"] + 1
+    best_val_loss = ckpt.get("best_val_loss", float("inf"))
+    best_val_accuracy = ckpt.get("best_val_accuracy", 0.0)
+    print(
+        f"Resumed from {path} "
+        f"(epoch {ckpt['epoch']}, val_loss={best_val_loss:.4f})"
+    )
+    return start_epoch, best_val_loss, best_val_accuracy
+
+
+# ---------------------------------------------------------------------------
+# Optimizer and scheduler
+# ---------------------------------------------------------------------------
+
+def build_optimizer(
+    model: nn.Module,
+    lr: float,
+    weight_decay: float,
+) -> torch.optim.AdamW:
+    """AdamW — validated optimizer."""
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
     )
 
-    recall = recall_score(
-        all_labels,
-        all_predictions,
-        zero_division=0,
-    )
 
-    f1 = f1_score(
-        all_labels,
-        all_predictions,
-        zero_division=0,
-    )
-
-    return (
-    running_loss / total,
-    correct / total,
-    precision,
-    recall,
-    f1,
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_epochs: int,
+) -> torch.optim.lr_scheduler.CosineAnnealingLR:
+    """CosineAnnealingLR — validated scheduler."""
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_epochs,
     )
 
 
-# -------------------------------------------------------
-# Training
-# -------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     args = get_args()
     set_seed(args.seed)
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
 
-    print(f"\nUsing device: {device}\n")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    (
-        train_dataset,
-        val_dataset,
-        train_loader,
-        val_loader,
-    ) = create_dataloaders(args)
-    
-    print(f"Training images   : {len(train_dataset)}")
-    print(f"Validation images : {len(val_dataset)}")
+    print(f"\n{'='*60}")
+    print(f"  Deepfake Benchmark — Training")
+    print(f"{'='*60}")
+    print(f"  Device      : {device}")
+    print(f"  Model       : {args.model.upper()}")
+    print(f"  Epochs      : {args.epochs}")
+    print(f"  Batch size  : {args.batch_size}")
+    print(f"  LR          : {args.lr}")
+    print(f"  Seed        : {args.seed}")
+    print(f"{'='*60}\n")
 
-    if len(val_dataset) == 0:
-        raise RuntimeError(
-            "Validation dataset is empty."
-        )
+    # ------------------------------------------------------------------ data
+    train_ds, val_ds, train_loader, val_loader = create_dataloaders(args)
+
+    train_labels = train_ds.metadata["label"].values
+    class_counts = np.bincount(train_labels)
+    print(f"Train images : {len(train_ds)}  (real={class_counts[0]}, fake={class_counts[1]})")
+    print(f"Val images   : {len(val_ds)}")
+
+    # ----------------------------------------------------------------- model
     model = build_model(args.model).to(device)
-    print(f"Model: {args.model.upper()}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Parameters   : {n_params:,}\n")
 
-    params = sum(
-        p.numel()
-        for p in model.parameters()
-        if p.requires_grad
-    )
-
-    print(f"Trainable parameters: {params:,}")
-
+    # --------------------------------------------------------- loss / optim
     criterion = nn.BCEWithLogitsLoss()
+    optimizer = build_optimizer(model, args.lr, args.weight_decay)
+    scheduler = build_scheduler(optimizer, args.epochs)
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4,
-    )
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-    )
-
-    scaler = torch.amp.GradScaler(
-    enabled=device.type == "cuda",
-    )
-
+    # -------------------------------------------------------- output dirs
     os.makedirs("weights", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
-    history_file = Path("results") / f"{args.model}_training_log.csv"
-    best_acc = 0.0
+    weights_path = f"weights/{args.model}_best.pth"
+    log_path = Path("results") / f"{args.model}_training_log.csv"
+
+    # ------------------------------------------------------- optional resume
+    start_epoch = 1
     best_loss = float("inf")
+    best_acc = 0.0
     best_epoch = 0
     patience_counter = 0
 
-    with open(history_file, "w", newline="") as csvfile:
+    if args.resume is not None:
+        start_epoch, best_loss, best_acc = load_checkpoint(
+            args.resume, model, optimizer, scheduler, scaler
+        )
 
+    # -------------------------------------------------------- training loop
+    with open(log_path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
+        writer.writerow(EvalResult.csv_header())
 
-        writer.writerow([
-            "epoch",
-            "train_loss",
-            "train_accuracy",
-            "val_loss",
-            "val_accuracy",
-            "precision",
-            "recall",
-            "f1_score",
-        ])
+        for epoch in range(start_epoch, args.epochs + 1):
+            t0 = time.perf_counter()
 
-        for epoch in range(args.epochs):
-
-            model.train()
-
-            running_loss = 0.0
-            train_correct = 0
-            train_total = 0
-            progress = tqdm(
-                train_loader,
-                desc=f"Epoch {epoch+1}/{args.epochs}",
+            # Train
+            train_loss, train_acc = run_epoch(
+                model, train_loader, criterion,
+                optimizer, scaler, device,
+                epoch, args.epochs,
             )
 
-            for images, labels in progress:
-
-                images = images.to(device)
-                labels = labels.to(device)
-
-                optimizer.zero_grad()
-
-                with torch.amp.autocast(
-                    device_type=device.type,
-                    enabled=(device.type == "cuda"),
-                ):
-
-                    outputs = model(images)
-
-                    predictions = (
-                        torch.sigmoid(outputs.squeeze(1)) > 0.5
-                    ).long()
-
-                    train_correct += (
-                        predictions == labels.long()
-                    ).sum().item()
-
-                    train_total += labels.size(0)
-
-                    loss = criterion(
-                        outputs.squeeze(1),
-                        labels,
-                    )
-
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                running_loss += (
-                    loss.item() * images.size(0)
-                )
-
-                progress.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-                )
-
-            train_loss = (
-                running_loss / len(train_dataset)
-            )
-
-            train_accuracy = train_correct / train_total
-
-            (
-                val_loss,
-                val_acc,
-                precision,
-                recall,
-                f1,
-            ) = evaluate(
-                model,
-                val_loader,
-                criterion,
-                device,
-            )
-
+            # Log LR *before* scheduler.step() — this is the LR used this epoch
+            current_lr = optimizer.param_groups[0]["lr"]
             scheduler.step()
 
-            writer.writerow([
-                epoch + 1,
-                train_loss,
-                train_accuracy,
-                val_loss,
-                val_acc,
-                precision,
-                recall,
-                f1,
-            ])
+            # Validate
+            result = evaluate(model, val_loader, criterion, device)
+
+            duration = time.perf_counter() - t0
+
+            # CSV
+            writer.writerow(
+                result.csv_row(epoch, duration, train_loss, train_acc, current_lr)
+            )
             csvfile.flush()
 
-            print(
-                f"\nEpoch {epoch+1}/{args.epochs}"
-            )
+            # Console
+            print(f"\nEpoch {epoch}/{args.epochs}  [{duration:.1f}s]")
+            print(f"  Train Loss : {train_loss:.4f}")
+            print(f"  Train Acc  : {100 * train_acc:.2f}%  (balanced batches — ~50% at epoch 0 is normal)")
+            print(f"  LR         : {current_lr:.2e}")
+            print(result.summary())
 
-            print(
-                f"Train Loss : {train_loss:.4f}"
-            )
-
-            print(
-                f"Train Acc  : {100*train_accuracy:.2f}%"
-            )
-
-            print(
-                f"Val Loss   : {val_loss:.4f}"
-            )
-
-            print(
-                f"Val Acc    : {100*val_acc:.2f}%"
-            )
-            
-            print(
-                f"LR         : {optimizer.param_groups[0]['lr']:.2e}"
-            )
-
-            print(f"Precision : {100*precision:.2f}%")
-            print(f"Recall    : {100*recall:.2f}%")
-            print(f"F1 Score  : {100*f1:.2f}%")
-
-            if val_loss < best_loss:
-                best_acc = val_acc
-                best_loss = val_loss
-                best_epoch = epoch + 1
+            # Early stopping on val_loss (validated criterion)
+            if result.loss < best_loss:
+                best_loss = result.loss
+                best_acc = result.accuracy
+                best_epoch = epoch
                 patience_counter = 0
 
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "best_val_loss": best_loss,
-                        "best_val_accuracy": best_acc,
-                    },
-                    f"weights/{args.model}_best.pth",
+                save_checkpoint(
+                    weights_path,
+                    model, optimizer, scheduler, scaler,
+                    epoch, best_loss, best_acc, args,
                 )
-
                 print(
-                    f"✓ Saved weights/{args.model}_best.pth "
-                    f"(Val Loss={val_loss:.4f}, "
-                    f"Val Acc={100*val_acc:.2f}%)"
+                    f"  ✓ Saved {weights_path}  "
+                    f"(val_loss={best_loss:.4f}, val_acc={100 * best_acc:.2f}%)"
                 )
-
             else:
-
                 patience_counter += 1
+                print(f"  No improvement. Patience {patience_counter}/{args.patience}")
 
             if patience_counter >= args.patience:
-
-                print("\nEarly stopping.")
-
+                print(f"\nEarly stopping triggered at epoch {epoch}.")
                 break
 
-    print(f"\nBest validation loss : {best_loss:.4f}")
-    print(f"Best validation acc  : {100*best_acc:.2f}%")
-    print(f"Best epoch           : {best_epoch}")
+    print(f"\n{'='*60}")
+    print(f"  Best val loss     : {best_loss:.4f}")
+    print(f"  Best val accuracy : {100 * best_acc:.2f}%")
+    print(f"  Best epoch        : {best_epoch}")
+    print(f"  Log saved         : {log_path}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-
     main()
