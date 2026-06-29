@@ -2,27 +2,6 @@
 train.py
 ========
 Training script for the Deepfake Detection Benchmark (EE656).
-
-Validated components (do NOT modify):
-    - WeightedRandomSampler        (class-balanced batches)
-    - BCEWithLogitsLoss            (without pos_weight — sampler already handles imbalance)
-    - AdamW                        (weight_decay=1e-4)
-    - CosineAnnealingLR            (T_max=epochs)
-    - AMP autocast + GradScaler    (CUDA only)
-    - Gradient clipping            (max_norm=1.0)
-    - Validation-loss early stopping
-    - Random seed behaviour
-
-Engineering improvements over original:
-    - Refactored into helper functions: run_epoch(), evaluate(), save_checkpoint()
-    - Expanded metrics: balanced accuracy, specificity, ROC-AUC, PR-AUC, MCC,
-      per-class recall, confusion matrix
-    - Fixed train_loss denominator (was len(dataset), now correctly total processed samples)
-    - LR logged BEFORE scheduler.step() so it reflects the epoch's actual LR
-    - CSV log includes all metrics + confusion matrix cells
-    - Resume training support via --resume
-    - Dataset sanity checks
-    - Type hints and docstrings throughout
 """
 
 from __future__ import annotations
